@@ -14,7 +14,8 @@ config:
   max_turns (default 3)
 
 Returns {output: the transcript, metadata: {template, handoff_dir, protected_names, turns: [{user, answer, tool_calls,
-error}], answers, stopped}}. A tester failure, or an agent failure on the first turn, is an `error`
+error}], answers, stopped}}. Runs only under an approved plan, within its agent-run budget
+(budget.py). A tester failure, or an agent failure on the first turn, is an `error`
 (counted apart from passes and failures); a later agent failure ends the conversation and is recorded.
 """
 from __future__ import annotations
@@ -25,6 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import agui_provider  # noqa: E402
+import budget  # noqa: E402
 import llm  # noqa: E402
 
 STOP = "STOP"
@@ -72,15 +74,21 @@ def _transcript(turns: list[dict]) -> str:
     return "\n---\n".join(parts)
 
 
-def call_api(prompt: str, options: dict | None = None, context: dict | None = None) -> dict:
-    config = (options or {}).get("config") or {}
-    vars_ = (context or {}).get("vars") or {}
+def converse(config: dict, next_message, *, kind: str = "tester") -> dict:
+    """The conversation loop shared by the tester and the replay: `next_message(turns)` gives the next
+    user message, or None to stop. Enforces the approved plan and counts every agent run against its
+    budget (budget.py) before it is sent."""
     target = config.get("target") or {}
-    tester = config.get("tester") or {}
     max_turns = int(config.get("max_turns", 3))
     if not target.get("url"):
         return {"error": "config.target.url is not set"}
-    brief = _brief(vars_)
+    plan_file = config.get("plan_file")
+    if not plan_file:
+        return {"error": "no plan: build the suite with build_suite.py (or build_replay.py), which writes one"}
+    try:
+        budget.check_plan(plan_file)
+    except budget.PlanError as e:
+        return {"error": f"plan: {e}"}
     agent_config = {"url": target["url"], "api_key_file": target.get("api_key_file", ""), "via": "agent",
                     "run_timeout_s": config.get("run_timeout_s", 600)}
     turns: list[dict] = []
@@ -88,11 +96,17 @@ def call_api(prompt: str, options: dict | None = None, context: dict | None = No
     stopped = "max_turns"
     for i in range(max_turns):
         try:
-            message = llm.chat(tester, brief, _tester_view(turns))
+            message = next_message(turns)
         except (llm.LLMError, OSError) as e:
-            return {"error": f"tester: {e}", "metadata": {"turns": turns}}
-        if not message or message.strip().upper().rstrip(".") == STOP:
-            stopped = "tester"
+            return {"error": f"{kind}: {e}", "metadata": {"turns": turns}}
+        if not message:
+            stopped = kind
+            break
+        allowed, used, limit = budget.take_run(plan_file)
+        if not allowed:
+            if i == 0:
+                return {"error": f"budget: all {limit} approved agent runs are used", "metadata": {"turns": turns}}
+            stopped = "budget"
             break
         res = agui_provider.call_api(message, {"config": agent_config}, {"vars": {"history": history}})
         turn = {"user": message, "answer": res.get("output", ""),
@@ -105,7 +119,7 @@ def call_api(prompt: str, options: dict | None = None, context: dict | None = No
             break
         history += [{"role": "user", "content": message}, {"role": "assistant", "content": turn["answer"]}]
     if not turns:
-        return {"error": "the tester stopped before the first turn"}
+        return {"error": f"the {kind} stopped before the first turn"}
     return {
         "output": _transcript(turns),
         "metadata": {
@@ -115,3 +129,16 @@ def call_api(prompt: str, options: dict | None = None, context: dict | None = No
             "tool_calls": [c for t in turns for c in t["tool_calls"]], "stopped": stopped,
         },
     }
+
+
+def call_api(prompt: str, options: dict | None = None, context: dict | None = None) -> dict:
+    config = (options or {}).get("config") or {}
+    vars_ = (context or {}).get("vars") or {}
+    tester = config.get("tester") or {}
+    brief = _brief(vars_)
+
+    def next_message(turns):
+        message = llm.chat(tester, brief, _tester_view(turns))
+        return None if not message or message.strip().upper().rstrip(".") == STOP else message
+
+    return converse(config, next_message, kind="tester")

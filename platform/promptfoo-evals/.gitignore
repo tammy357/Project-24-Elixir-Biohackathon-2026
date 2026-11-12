@@ -7,3 +7,6 @@ __pycache__/
 *.env
 matrix/targets.yaml
 matrix/matrix.generated.yaml
+matrix/matrix.replay.yaml
+matrix/*.plan.json
+matrix/*.ledger.json

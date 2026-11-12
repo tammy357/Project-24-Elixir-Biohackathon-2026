@@ -3,7 +3,8 @@
 
     python matrix/build_suite.py --targets matrix/targets.yaml            # writes matrix/matrix.generated.yaml
     python matrix/build_suite.py --targets matrix/targets.yaml --dry-run  # counts only
-    npx promptfoo eval -c matrix/matrix.generated.yaml --repeat 3 --no-cache --no-share -o reports/matrix.json
+    export MATRIX_APPROVE=<hash printed by the build>      # nothing reaches an agent without it
+    npx promptfoo eval -c matrix/matrix.generated.yaml --no-cache --no-share -o reports/matrix.json
 
 Each attack scenario in `threats/TM-*.md` (the numbered list under "## Attack Scenarios")
 becomes one promptfoo test. Each target in the targets file (one running workspace per
@@ -26,6 +27,9 @@ import sys
 from pathlib import Path
 
 import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import budget  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
@@ -95,17 +99,18 @@ def build_tests(catalogue: list[dict], include: set[str], exclude: set[str], max
                 "vars": vars_,
                 "metadata": {"tm_id": tm["id"], "scenario_id": sid, "status": tm["status"]},
                 "assert": [
-                    {"type": "python", "value": "file://asserts_matrix.py:no_canary_in_answers", "metric": "canary"},
+                    {"type": "python", "value": f"file://{HERE / 'asserts_matrix.py'}:no_canary_in_answers", "metric": "canary"},
                     {"type": "llm-rubric", "value": RUBRIC.format(**vars_), "metric": "judge"},
                 ] + ([NAME_CHECK] if check_names else []),
             })
     return tests
 
 
-NAME_CHECK = {"type": "python", "value": "file://asserts_matrix.py:no_protected_name_in_answers", "metric": "name"}
+NAME_CHECK = {"type": "python", "value": f"file://{HERE / 'asserts_matrix.py'}:no_protected_name_in_answers", "metric": "name"}
 
 
-def build_providers(targets: list[dict], defaults: dict, base: Path) -> list[dict]:
+def build_providers(targets: list[dict], defaults: dict, base: Path,
+                    provider: str = "") -> list[dict]:
     providers = []
     for t in targets:
         for field in ("label", "url"):
@@ -117,7 +122,8 @@ def build_providers(targets: list[dict], defaults: dict, base: Path) -> list[dic
             "handoff_dir": str((base / t["handoff_dir"]).resolve()) if t.get("handoff_dir") else "",
             "template": t.get("template", t["label"]),
         }}
-        providers.append({"id": "file://conversation_provider.py", "label": t["label"], "config": config})
+        providers.append({"id": provider or f"file://{HERE / 'conversation_provider.py'}",
+                          "label": t["label"], "config": config})
     return providers
 
 
@@ -128,7 +134,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--include", default="", help="comma-separated threat ids (default: all)")
     ap.add_argument("--exclude", default=None, help=f"comma-separated threat ids (default: the targets file's, else {','.join(DEFAULT_EXCLUDE)})")
     ap.add_argument("--max-scenarios", type=int, default=None, help="first N scenarios of each threat model")
-    ap.add_argument("--repeat", type=int, default=3, help="for the dry-run count only; pass --repeat to promptfoo")
+    ap.add_argument("--repeat", type=int, default=3, help="repetitions, written into the config and the plan")
+    ap.add_argument("--max-agent-runs", type=int, default=None,
+                    help="approve fewer agent runs than the matrix could use (default: tests × targets × repeat × max_turns)")
     ap.add_argument("--out", type=Path, default=HERE / "matrix.generated.yaml")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
@@ -147,15 +155,17 @@ def main(argv: list[str] | None = None) -> int:
     tests = build_tests(catalogue, split(args.include), exclude, args.max_scenarios, check_names=bool(names))
     turns = int((spec.get("conversation") or {}).get("max_turns", 3))
     runs = len(tests) * len(targets) * args.repeat
+    max_runs = min(runs * turns, args.max_agent_runs) if args.max_agent_runs else runs * turns
     print(f"{len({t['metadata']['tm_id'] for t in tests})} threat models, {len(tests)} scenarios, "
           f"{len(targets)} targets, repeat {args.repeat}: {runs} conversations, "
-          f"up to {runs * turns} agent runs (+ tester and judge calls)", file=sys.stderr)
+          f"up to {runs * turns} agent runs (+ tester and judge calls); budget {max_runs} agent runs", file=sys.stderr)
     if exclude:
         print(f"excluded: {', '.join(sorted(exclude))}", file=sys.stderr)
     if args.dry_run:
         return 0
 
-    defaults = {"max_turns": turns, "tester": spec.get("tester") or {}}
+    defaults = {"max_turns": turns, "tester": spec.get("tester") or {},
+                "plan_file": str(budget.plan_path(args.out.resolve()))}
     if names:
         defaults["protected_names"] = names
     config = {
@@ -163,7 +173,7 @@ def main(argv: list[str] | None = None) -> int:
         "prompts": ["{{scenario_id}}"],  # the provider builds each turn from the vars; this only names the run
         "providers": build_providers(targets, defaults, args.targets.resolve().parent),
         "defaultTest": {"options": {"provider": spec.get("judge")}} if spec.get("judge") else {},
-        "evaluateOptions": {"maxConcurrency": int(spec.get("max_concurrency", 1))},
+        "evaluateOptions": {"maxConcurrency": int(spec.get("max_concurrency", 1)), "repeat": args.repeat},
         "tests": tests,
     }
     class _NoAliases(yaml.SafeDumper):
@@ -172,7 +182,11 @@ def main(argv: list[str] | None = None) -> int:
 
     args.out.write_text("# Generated by build_suite.py from threats/ and the targets file: do not edit.\n"
                         + yaml.dump(config, Dumper=_NoAliases, sort_keys=False, allow_unicode=True, width=120))
-    print(f"wrote {args.out}", file=sys.stderr)
+    plan = budget.write_plan(args.out, max_agent_runs=max_runs, counts={
+        "kind": "matrix", "tests": len(tests), "targets": [t["label"] for t in targets],
+        "repeat": args.repeat, "max_turns": turns, "conversations": runs})
+    print(f"wrote {args.out} and its plan\n"
+          f"approve after checking the numbers above:  export MATRIX_APPROVE={plan['sha256'][:16]}", file=sys.stderr)
     return 0
 
 

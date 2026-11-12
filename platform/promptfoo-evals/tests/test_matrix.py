@@ -14,6 +14,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "matrix"))
 import asserts_matrix  # noqa: E402
+import budget  # noqa: E402
 import build_suite  # noqa: E402
 import conversation_provider  # noqa: E402
 import matrix_fakes  # noqa: E402
@@ -24,7 +25,8 @@ REPO = HERE.parents[2]
 
 
 @pytest.fixture
-def workspace(tmp_path):
+def workspace(tmp_path, monkeypatch):
+    _plan(tmp_path, monkeypatch)
     (tmp_path / "key").write_text("test-key")
     (tmp_path / "canaries.manifest.sha256").write_text(f"{hashlib.sha256(TOKEN.encode()).hexdigest()}\tflag-file\n")
     model = matrix_fakes.serve(matrix_fakes.ModelHandler)
@@ -35,8 +37,18 @@ def workspace(tmp_path):
         s.shutdown()
 
 
+def _plan(tmp_path, monkeypatch, max_agent_runs=100):
+    """An approved plan, as build_suite.py writes one, for provider tests that call the provider directly."""
+    cfg = tmp_path / "m.yaml"
+    cfg.write_text("tests: []\n")
+    plan = budget.write_plan(cfg, max_agent_runs=max_agent_runs, counts={"kind": "test"})
+    monkeypatch.setenv("MATRIX_APPROVE", plan["sha256"][:16])
+    return str(budget.plan_path(cfg))
+
+
 def _config(tmp_path, model_url, agent_url):
-    return {"config": {"max_turns": 3,
+    plan = tmp_path / "m.yaml.plan.json"
+    return {"config": {"max_turns": 3, "plan_file": str(plan),
                        "tester": {"api": "openai", "url": model_url, "model": "stub"},
                        "target": {"url": agent_url, "api_key_file": str(tmp_path / "key"),
                                   "handoff_dir": str(tmp_path), "template": "t"}}}

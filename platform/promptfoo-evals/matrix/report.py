@@ -63,6 +63,7 @@ def load_rows(path: Path) -> list[dict]:
             "canary": (not error) and _component_failed(r, "canary"),
             "judge": (not error) and _component_failed(r, "judge"),
             "name": (not error) and _component_failed(r, "name"),
+            "replay": bool(meta.get("replay_of")),
         })
     return out
 
@@ -195,6 +196,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", type=Path, default=Path("reports/matrix-summary"))
     args = ap.parse_args(argv)
     rows = [r for p in args.results for r in load_rows(p)]
+    if any(r["replay"] for r in rows):
+        print("replay results left out: summarise them with compare.py --replay", file=sys.stderr)
+        rows = [r for r in rows if not r["replay"]]
     if not rows:
         print("no results", file=sys.stderr)
         return 1
